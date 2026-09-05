@@ -47,7 +47,6 @@ async function fetchImageryWords(text) {
   try {
     const data = await claudeFetch({
       model: "claude-sonnet-4-6",
-      max_tokens: 1000,
       system:
         "You are a linguist specialising in memory and imagery. " +
         "When given a passage, return ONLY a JSON array of the high-imagery words — " +
@@ -91,6 +90,28 @@ function pickWordsToRemove(tokens, removedIndices, level, imageryWordSet) {
   return picked;
 }
 
+// Group sorted blank token-indices into consecutive runs.
+// Two blank indices are "consecutive" if all tokens between them are non-word
+// characters (spaces, punctuation) — i.e. no visible word separates them.
+function groupConsecutiveBlanks(sortedIdxs, tokens) {
+  if (sortedIdxs.length === 0) return [];
+  const groups = [[sortedIdxs[0]]];
+  for (let i = 1; i < sortedIdxs.length; i++) {
+    const prev = sortedIdxs[i - 1];
+    const curr = sortedIdxs[i];
+    // Check whether any word token exists between prev and curr
+    const hasWordBetween = tokens
+      .slice(prev + 1, curr)
+      .some(t => /[\w']+/.test(t));
+    if (hasWordBetween) {
+      groups.push([curr]);
+    } else {
+      groups[groups.length - 1].push(curr);
+    }
+  }
+  return groups; // Array of arrays of token indices
+}
+
 // ── component ─────────────────────────────────────────────────────────────────
 
 export default function RecallTrainer() {
@@ -101,7 +122,7 @@ export default function RecallTrainer() {
   const [analysing, setAnalysing] = useState(false);
   const [removedIndices, setRemovedIndices] = useState(new Set());
   const [level, setLevel] = useState(1);
-  const [currentBlankIdx, setCurrentBlankIdx] = useState(null);
+  // blanksOrder is now an array of GROUPS (each group = array of token indices)
   const [blanksOrder, setBlanksOrder] = useState([]);
   const [blanksStatus, setBlanksStatus] = useState({});
   const [typedAnswer, setTypedAnswer] = useState("");
@@ -121,7 +142,10 @@ export default function RecallTrainer() {
     setTimeout(() => inputRef.current?.focus(), 80);
   }, []);
 
-  // ── advance to next blank ─────────────────────────────────────────────────
+  // Current group = first element of blanksOrder
+  const currentGroup = blanksOrder[0] || null;
+
+  // ── advance to next group ─────────────────────────────────────────────────
 
   const advanceBlank = useCallback(() => {
     setFeedback(null);
@@ -134,7 +158,6 @@ export default function RecallTrainer() {
         finishRound();
         return [];
       }
-      setCurrentBlankIdx(next[0]);
       setTimeout(() => inputRef.current?.focus(), 80);
       return next;
     });
@@ -143,36 +166,55 @@ export default function RecallTrainer() {
   // ── check answer ──────────────────────────────────────────────────────────
 
   const checkAnswer = useCallback((answer) => {
-    if (currentBlankIdx === null) return;
-    const correct = tokens[currentBlankIdx].toLowerCase().replace(/[^a-z']/g, "");
-    const clean = answer.toLowerCase().replace(/[^a-z']/g, "");
-    if (clean === correct) {
+    if (!currentGroup) return;
+    // Split typed answer by whitespace into words
+    const typedWords = answer.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    const correctWords = currentGroup.map(i =>
+      tokens[i].toLowerCase().replace(/[^a-z']/g, "")
+    );
+
+    if (typedWords.length !== correctWords.length) {
+      setFeedback({
+        type: "wrong",
+        msg: `Need ${correctWords.length} word${correctWords.length > 1 ? "s" : ""} — try again`,
+      });
+      focusInput();
+      return;
+    }
+
+    const allCorrect = typedWords.every((w, i) => w === correctWords[i]);
+
+    if (allCorrect) {
       setFeedback({ type: "correct", msg: "✓ Correct!" });
-      const updated = { ...blanksStatus, [currentBlankIdx]: "correct" };
+      const updated = { ...blanksStatus };
+      currentGroup.forEach(i => { updated[i] = "correct"; });
       setBlanksStatus(updated);
       setTimeout(() => advanceBlank(), 900);
     } else {
-      setFeedback({ type: "wrong", msg: `"${answer}" — try again` });
+      // Show which words were wrong
+      const wrongOnes = typedWords
+        .map((w, i) => w !== correctWords[i] ? `"${w}"` : null)
+        .filter(Boolean)
+        .join(", ");
+      setFeedback({ type: "wrong", msg: `${wrongOnes} — try again` });
       focusInput();
     }
-  }, [currentBlankIdx, tokens, blanksStatus, advanceBlank, focusInput]);
+  }, [currentGroup, tokens, blanksStatus, advanceBlank, focusInput]);
 
   const submitAnswer = () => {
-    if (typedAnswer.trim()) {
-      const a = typedAnswer.trim();
-      setTypedAnswer("");
-      checkAnswer(a);
-    }
+    if (typedAnswer.trim()) checkAnswer(typedAnswer.trim());
   };
 
-  // ── hints (multi-tap) ─────────────────────────────────────────────────────
+  // ── hints ─────────────────────────────────────────────────────────────────
+  // For groups, hint applies to the first un-hinted word in the group
 
   const tapHint = async () => {
-    if (currentBlankIdx === null || loading) return;
-    const word = tokens[currentBlankIdx].toLowerCase().replace(/[^a-z']/g, "");
+    if (!currentGroup || loading) return;
+    // Always hint on the first word of the group for simplicity
+    const word = tokens[currentGroup[0]].toLowerCase().replace(/[^a-z']/g, "");
     const nextStage = hintStage + 1;
     setHintStage(nextStage);
-    setHintUsed((prev) => ({ ...prev, [currentBlankIdx]: true }));
+    setHintUsed((prev) => ({ ...prev, [currentGroup[0]]: true }));
 
     if (nextStage === 1) {
       setLoading(true);
@@ -187,9 +229,9 @@ export default function RecallTrainer() {
         const rawDef = defData?.[0]?.defs?.[0] || null;
         const definition = rawDef ? rawDef.split("\t")[1]?.split(" ").slice(0, 8).join(" ") : null;
         if (synonym) {
-          setHint(synonym);
+          setHint(currentGroup.length > 1 ? `First word: ${synonym}` : synonym);
         } else if (definition) {
-          setHint(definition);
+          setHint(currentGroup.length > 1 ? `First word: ${definition}` : definition);
         } else {
           setHint(word.split("").map((l, i) => i === 0 ? l : "_").join(" "));
           setHintStage(2);
@@ -202,7 +244,8 @@ export default function RecallTrainer() {
     } else {
       const letters = word.split("");
       const revealed = nextStage - 1;
-      setHint(letters.map((l, i) => (i < revealed ? l : "_")).join(" "));
+      const display = letters.map((l, i) => (i < revealed ? l : "_")).join(" ");
+      setHint(currentGroup.length > 1 ? `First word: ${display}` : display);
     }
     focusInput();
   };
@@ -210,20 +253,24 @@ export default function RecallTrainer() {
   // ── reveal ────────────────────────────────────────────────────────────────
 
   const revealWord = () => {
-    if (currentBlankIdx === null) return;
-    const word = tokens[currentBlankIdx];
-    setRevealUsed((prev) => ({ ...prev, [currentBlankIdx]: true }));
-    setFeedback({ type: "reveal", msg: `The word is: "${word}"` });
-    const updated = { ...blanksStatus, [currentBlankIdx]: "skipped" };
+    if (!currentGroup) return;
+    const words = currentGroup.map(i => tokens[i]).join(" ");
+    setRevealUsed((prev) => {
+      const u = { ...prev };
+      currentGroup.forEach(i => { u[i] = true; });
+      return u;
+    });
+    setFeedback({ type: "reveal", msg: `The word${currentGroup.length > 1 ? "s are" : " is"}: "${words}"` });
+    const updated = { ...blanksStatus };
+    currentGroup.forEach(i => { updated[i] = "skipped"; });
     setBlanksStatus(updated);
-    setTimeout(() => advanceBlank(), 1500);
+    setTimeout(() => advanceBlank(), 1800);
   };
 
   // ── finish round ──────────────────────────────────────────────────────────
 
   const finishRound = useCallback(() => {
     setBlanksOrder([]);
-    setCurrentBlankIdx(null);
     const total = removedIndices.size;
     const correct = Object.values(blanksStatus).filter((v) => v === "correct").length;
     const hints = Object.keys(hintUsed).length;
@@ -263,9 +310,9 @@ export default function RecallTrainer() {
     const initialStatus = {};
     wordIdxs.forEach((i) => (initialStatus[i] = "pending"));
     setBlanksStatus(initialStatus);
-    setBlanksOrder(wordIdxs);
-    if (wordIdxs.length > 0) {
-      setCurrentBlankIdx(wordIdxs[0]);
+    const groups = groupConsecutiveBlanks(wordIdxs, t);
+    setBlanksOrder(groups);
+    if (groups.length > 0) {
       setTimeout(() => inputRef.current?.focus(), 150);
     }
   };
@@ -290,16 +337,16 @@ export default function RecallTrainer() {
   const renderPassage = () => tokens.map((token, i) => {
     if (removedIndices.has(i) && /[\w']+/.test(token)) {
       const status = blanksStatus[i] || "pending";
-      const isCurrent = i === currentBlankIdx;
+      const isCurrentGroup = currentGroup?.includes(i);
       return (
         <span key={i} style={{
           display: "inline",
           borderBottom: "2px solid",
-          borderColor: status === "correct" ? "#4CAF82" : status === "skipped" ? "#888" : isCurrent ? "#F5A623" : "#3A3F52",
+          borderColor: status === "correct" ? "#4CAF82" : status === "skipped" ? "#888" : isCurrentGroup ? "#F5A623" : "#3A3F52",
           paddingBottom: "1px",
           margin: "0 1px",
-          backgroundColor: status === "correct" ? "rgba(76,207,130,0.08)" : status === "skipped" ? "rgba(136,136,136,0.08)" : isCurrent ? "rgba(245,166,35,0.12)" : "transparent",
-          animation: isCurrent ? "pulse 1.8s ease-in-out infinite" : "none",
+          backgroundColor: status === "correct" ? "rgba(76,207,130,0.08)" : status === "skipped" ? "rgba(136,136,136,0.08)" : isCurrentGroup ? "rgba(245,166,35,0.12)" : "transparent",
+          animation: isCurrentGroup ? "pulse 1.8s ease-in-out infinite" : "none",
           color: status === "correct" ? "#4CAF82" : status === "skipped" ? "#888" : "transparent",
           fontStyle: status === "skipped" ? "italic" : "normal",
         }}>
@@ -309,6 +356,14 @@ export default function RecallTrainer() {
     }
     return <span key={i} style={{ color: "#F2E8D5" }}>{token}</span>;
   });
+
+  // ── placeholder text for input ────────────────────────────────────────────
+
+  const inputPlaceholder = currentGroup
+    ? currentGroup.length > 1
+      ? `Type ${currentGroup.length} words separated by spaces…`
+      : "Type the missing word…"
+    : "";
 
   // ── screens ───────────────────────────────────────────────────────────────
 
@@ -372,8 +427,9 @@ export default function RecallTrainer() {
     );
   }
 
-  const totalBlanks = removedIndices.size;
-  const done = totalBlanks - blanksOrder.length;
+  const totalBlanks = blanksOrder.reduce((sum, g) => sum + g.length, 0) +
+    Object.values(blanksStatus).filter(v => v === "correct" || v === "skipped").length;
+  const done = Object.values(blanksStatus).filter(v => v === "correct" || v === "skipped").length;
 
   return (
     <div style={S.root}>
@@ -390,8 +446,15 @@ export default function RecallTrainer() {
         <p style={S.passage}>{renderPassage()}</p>
       </div>
 
-      {currentBlankIdx !== null && (
+      {currentGroup && (
         <div style={S.controls}>
+
+          {/* Group size label */}
+          {currentGroup.length > 1 && (
+            <div style={S.groupLabel}>
+              {currentGroup.length} consecutive words — type them all separated by spaces
+            </div>
+          )}
 
           {/* Feedback */}
           {feedback && (
@@ -407,7 +470,7 @@ export default function RecallTrainer() {
           {hint && (
             <div style={S.hintBox}>
               <span style={{ opacity: 0.6, fontSize: 11, fontFamily: "system-ui, sans-serif", letterSpacing: "0.1em", textTransform: "uppercase", display: "block", marginBottom: 4 }}>
-                {hintStage === 1 ? "Related word" : `Letters (${hintStage - 1} of ${tokens[currentBlankIdx]?.toLowerCase().replace(/[^a-z']/g, "").length})`}
+                {hintStage === 1 ? "Related word" : `Letters (${hintStage - 1} of ${tokens[currentGroup[0]]?.toLowerCase().replace(/[^a-z']/g, "").length})`}
               </span>
               <span style={{ fontFamily: hintStage > 1 ? "monospace" : "inherit", fontSize: hintStage > 1 ? 22 : 14, letterSpacing: hintStage > 1 ? "0.2em" : "normal" }}>
                 {hint}
@@ -415,13 +478,13 @@ export default function RecallTrainer() {
             </div>
           )}
 
-          {/* Input row + Hints button side by side */}
+          {/* Input row */}
           <div style={S.inputRow}>
             <input
               ref={inputRef}
               style={S.typeInput}
               type="text"
-              placeholder="Type the missing word…"
+              placeholder={inputPlaceholder}
               value={typedAnswer}
               onChange={e => setTypedAnswer(e.target.value)}
               onKeyDown={e => { if (e.key === "Enter") submitAnswer(); }}
@@ -438,7 +501,9 @@ export default function RecallTrainer() {
           </div>
 
           {/* Reveal */}
-          <button style={{ ...S.btn, ...S.btnGhost }} onClick={revealWord}>👁 Reveal</button>
+          <button style={{ ...S.btn, ...S.btnGhost }} onClick={revealWord}>
+            👁 Reveal{currentGroup.length > 1 ? " all" : ""}
+          </button>
 
         </div>
       )}
@@ -465,6 +530,7 @@ const S = {
   passageWrap: { width: "100%", maxWidth: 680, background: "#181C27", border: "1px solid #1E2436", borderRadius: 12, padding: "28px", marginBottom: 24 },
   passage: { fontSize: 19, lineHeight: 2, margin: 0, letterSpacing: "0.01em" },
   controls: { width: "100%", maxWidth: 680, display: "flex", flexDirection: "column", gap: 12 },
+  groupLabel: { fontFamily: "system-ui, sans-serif", fontSize: 12, color: "#F5A623", textAlign: "center", opacity: 0.8 },
   feedbackBox: { padding: "12px 16px", borderRadius: 8, border: "1px solid", fontFamily: "system-ui, sans-serif", fontSize: 14, textAlign: "center" },
   hintBox: { padding: "12px 16px", borderRadius: 8, background: "rgba(245,166,35,0.08)", border: "1px solid rgba(245,166,35,0.2)", color: "#F5A623", fontFamily: "system-ui, sans-serif", fontSize: 14 },
   inputRow: { display: "flex", gap: 8, alignItems: "stretch" },
