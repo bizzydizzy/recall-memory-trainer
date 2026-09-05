@@ -7,7 +7,8 @@ function tokenise(text) {
 }
 
 async function claudeFetch(body) {
-  const apiKey = typeof import.meta !== "undefined" && import.meta.env?.VITE_ANTHROPIC_API_KEY;
+  let apiKey = null;
+  try { apiKey = import.meta.env?.VITE_ANTHROPIC_API_KEY || null; } catch {}
   const headers = { "Content-Type": "application/json" };
   if (apiKey) headers["x-api-key"] = apiKey;
   const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -18,17 +19,6 @@ async function claudeFetch(body) {
   const data = await res.json();
   if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
   return data;
-}
-
-async function callClaude(messages, system = "") {
-  try {
-    const body = { model: "claude-sonnet-4-6", max_tokens: 1000, messages };
-    if (system) body.system = system;
-    const data = await claudeFetch(body);
-    return data.content?.map((b) => b.text || "").join("") || "";
-  } catch {
-    return "";
-  }
 }
 
 function localImageryFallback(text) {
@@ -117,7 +107,7 @@ export default function RecallTrainer() {
   const [listening, setListening] = useState(false);
   const [transcript, setTranscript] = useState("");
   const [hint, setHint] = useState("");
-  const [hintStage, setHintStage] = useState(0); // 0=none, 1=word/def, 2+=letters
+  const [hintStage, setHintStage] = useState(0);
   const [hintUsed, setHintUsed] = useState({});
   const [revealUsed, setRevealUsed] = useState({});
   const [feedback, setFeedback] = useState(null);
@@ -162,7 +152,7 @@ export default function RecallTrainer() {
       setBlanksStatus(updated);
       setTimeout(() => advanceBlank(), 900);
     } else {
-      setFeedback({ type: "wrong", msg: `Heard "${spoken}" — try again` });
+      setFeedback({ type: "wrong", msg: `"${spoken}" — try again` });
     }
   }, [currentBlankIdx, tokens, blanksStatus, advanceBlank]);
 
@@ -170,50 +160,40 @@ export default function RecallTrainer() {
 
   const tapHint = async () => {
     if (currentBlankIdx === null || loading) return;
-    const word = tokens[currentBlankIdx];
+    const word = tokens[currentBlankIdx].toLowerCase().replace(/[^a-z']/g, "");
     const nextStage = hintStage + 1;
     setHintStage(nextStage);
     setHintUsed((prev) => ({ ...prev, [currentBlankIdx]: true }));
 
     if (nextStage === 1) {
-      // Stage 1: related word or short definition
       setLoading(true);
       try {
-        const body = {
-          model: "claude-sonnet-4-6",
-          max_tokens: 1000,
-          messages: [{
-            role: "user",
-            content:
-              `For the word "${word}", give a single closely related word (synonym or strong association). ` +
-              `If none exists, give a definition of 8 words or fewer. ` +
-              `Do NOT use the word "${word}". Reply with just the word or definition, nothing else.`,
-          }]
-        };
-        const res = await fetch("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          setHint(`API error: ${data?.error?.message || res.status}`);
+        const [synRes, defRes] = await Promise.all([
+          fetch(`https://api.datamuse.com/words?rel_syn=${encodeURIComponent(word)}&max=3`),
+          fetch(`https://api.datamuse.com/words?sp=${encodeURIComponent(word)}&md=d&max=1`),
+        ]);
+        const synData = await synRes.json();
+        const defData = await defRes.json();
+        const synonym = synData?.[0]?.word || null;
+        const rawDef = defData?.[0]?.defs?.[0] || null;
+        const definition = rawDef ? rawDef.split("\t")[1]?.split(" ").slice(0, 8).join(" ") : null;
+        if (synonym) {
+          setHint(synonym);
+        } else if (definition) {
+          setHint(definition);
         } else {
-          const reply = data.content?.map(b => b.text || "").join("").trim();
-          setHint(reply || "(empty response)");
+          setHint(word.split("").map((l, i) => i === 0 ? l : "_").join(" "));
+          setHintStage(2);
         }
-      } catch (e) {
-        setHint(`Network error: ${e.message}`);
+      } catch {
+        setHint(word.split("").map((l, i) => i === 0 ? l : "_").join(" "));
+        setHintStage(2);
       }
       setLoading(false);
     } else {
-      // Stage 2+: reveal one more letter each tap
-      const letters = word.replace(/[^a-zA-Z']/g, "").split("");
-      const revealed = nextStage - 1; // how many letters to show
-      const display = letters
-        .map((l, i) => (i < revealed ? l : "_"))
-        .join(" ");
-      setHint(`${display}`);
+      const letters = word.split("");
+      const revealed = nextStage - 1;
+      setHint(letters.map((l, i) => (i < revealed ? l : "_")).join(" "));
     }
   };
 
@@ -303,7 +283,6 @@ export default function RecallTrainer() {
     try {
       const data = await claudeFetch({
         model: "claude-sonnet-4-6",
-        max_tokens: 50,
         messages: [{
           role: "user",
           content: [
@@ -311,7 +290,7 @@ export default function RecallTrainer() {
             { type: "document", source: { type: "base64", media_type: audioBlob.type || "audio/webm", data: base64Audio } }
           ]
         }]
-      }, 15000);
+      });
       return data.content?.map(b => b.text || "").join("").trim().toLowerCase() || "";
     } catch {
       return "";
@@ -371,7 +350,6 @@ export default function RecallTrainer() {
           margin: "0 1px",
           backgroundColor: status === "correct" ? "rgba(76,207,130,0.08)" : status === "skipped" ? "rgba(136,136,136,0.08)" : isCurrent ? "rgba(245,166,35,0.12)" : "transparent",
           animation: isCurrent ? "pulse 1.8s ease-in-out infinite" : "none",
-          minWidth: (status === "correct" || status === "skipped") ? undefined : `${Math.max(token.length * 0.65, 2)}ch`,
           color: status === "correct" ? "#4CAF82" : status === "skipped" ? "#888" : "transparent",
           fontStyle: status === "skipped" ? "italic" : "normal",
         }}>
@@ -497,7 +475,7 @@ export default function RecallTrainer() {
           {hint && (
             <div style={S.hintBox}>
               <span style={{ opacity: 0.6, fontSize: 11, fontFamily: "system-ui, sans-serif", letterSpacing: "0.1em", textTransform: "uppercase", display: "block", marginBottom: 4 }}>
-                {hintStage === 1 ? "Related word" : `Letters (${hintStage - 1} of ${tokens[currentBlankIdx]?.replace(/[^a-zA-Z']/g,"").length})`}
+                {hintStage === 1 ? "Related word" : `Letters (${hintStage - 1} of ${tokens[currentBlankIdx]?.toLowerCase().replace(/[^a-z']/g, "").length})`}
               </span>
               <span style={{ fontFamily: hintStage > 1 ? "monospace" : "inherit", fontSize: hintStage > 1 ? 22 : 14, letterSpacing: hintStage > 1 ? "0.2em" : "normal" }}>
                 {hint}
@@ -536,17 +514,14 @@ export default function RecallTrainer() {
         </div>
       )}
 
-      {/* Floating Hints button */}
       {currentBlankIdx !== null && (
         <button style={S.floatingHint} onClick={tapHint} disabled={loading}>
-          {loading ? "…" : hintStage === 0 ? "Hints" : hintStage === 1 ? "Letter?" : `+1 letter`}
+          {loading ? "…" : hintStage === 0 ? "Hints" : hintStage === 1 ? "Letter?" : "+1 letter"}
         </button>
       )}
     </div>
   );
 }
-
-// ── styles ────────────────────────────────────────────────────────────────────
 
 const S = {
   root: { minHeight: "100vh", background: "#0F1117", color: "#F2E8D5", fontFamily: "'Georgia', serif", display: "flex", flexDirection: "column", alignItems: "center", padding: "24px 16px 48px" },
@@ -569,7 +544,7 @@ const S = {
   controls: { width: "100%", maxWidth: 680, display: "flex", flexDirection: "column", gap: 12 },
   feedbackBox: { padding: "12px 16px", borderRadius: 8, border: "1px solid", fontFamily: "system-ui, sans-serif", fontSize: 14, textAlign: "center" },
   hintBox: { padding: "12px 16px", borderRadius: 8, background: "rgba(245,166,35,0.08)", border: "1px solid rgba(245,166,35,0.2)", color: "#F5A623", fontFamily: "system-ui, sans-serif", fontSize: 14 },
-  floatingHint: { position: "fixed", bottom: 28, right: 24, background: "#1E2436", border: "1px solid #3A3F52", borderRadius: 24, color: "#F2E8D5", fontFamily: "system-ui, sans-serif", fontWeight: 600, fontSize: 14, padding: "12px 20px", cursor: "pointer", zIndex: 50, boxShadow: "0 4px 20px rgba(0,0,0,0.4)", letterSpacing: "0.03em", transition: "background 0.15s, border-color 0.15s" },
+  floatingHint: { position: "fixed", bottom: 28, right: 24, background: "#1E2436", border: "1px solid #3A3F52", borderRadius: 24, color: "#F2E8D5", fontFamily: "system-ui, sans-serif", fontWeight: 600, fontSize: 14, padding: "12px 20px", cursor: "pointer", zIndex: 50, boxShadow: "0 4px 20px rgba(0,0,0,0.4)", letterSpacing: "0.03em" },
   transcriptBox: { padding: "10px 16px", borderRadius: 8, background: "#1E2436", color: "#888", fontFamily: "system-ui, sans-serif", fontSize: 13, textAlign: "center" },
   secondaryBtns: { display: "flex", gap: 8 },
   scoreCard: { width: "100%", maxWidth: 480, display: "flex", flexDirection: "column", alignItems: "center", paddingTop: 48, gap: 16 },
