@@ -104,8 +104,7 @@ export default function RecallTrainer() {
   const [currentBlankIdx, setCurrentBlankIdx] = useState(null);
   const [blanksOrder, setBlanksOrder] = useState([]);
   const [blanksStatus, setBlanksStatus] = useState({});
-  const [listening, setListening] = useState(false);
-  const [transcript, setTranscript] = useState("");
+  const [typedAnswer, setTypedAnswer] = useState("");
   const [hint, setHint] = useState("");
   const [hintStage, setHintStage] = useState(0);
   const [hintUsed, setHintUsed] = useState({});
@@ -114,13 +113,13 @@ export default function RecallTrainer() {
   const [scoreData, setScoreData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [roundHistory, setRoundHistory] = useState([]);
-  const [micBlocked, setMicBlocked] = useState(false);
-  const [useTyping, setUseTyping] = useState(false);
-  const [typedAnswer, setTypedAnswer] = useState("");
 
-  const mediaRecorderRef = useRef(null);
-  const audioChunksRef = useRef([]);
   const textareaRef = useRef(null);
+  const inputRef = useRef(null);
+
+  const focusInput = useCallback(() => {
+    setTimeout(() => inputRef.current?.focus(), 80);
+  }, []);
 
   // ── advance to next blank ─────────────────────────────────────────────────
 
@@ -128,7 +127,7 @@ export default function RecallTrainer() {
     setFeedback(null);
     setHint("");
     setHintStage(0);
-    setTranscript("");
+    setTypedAnswer("");
     setBlanksOrder((order) => {
       const next = order.slice(1);
       if (next.length === 0) {
@@ -136,25 +135,35 @@ export default function RecallTrainer() {
         return [];
       }
       setCurrentBlankIdx(next[0]);
+      setTimeout(() => inputRef.current?.focus(), 80);
       return next;
     });
   }, []); // eslint-disable-line
 
   // ── check answer ──────────────────────────────────────────────────────────
 
-  const checkAnswer = useCallback((spoken) => {
+  const checkAnswer = useCallback((answer) => {
     if (currentBlankIdx === null) return;
     const correct = tokens[currentBlankIdx].toLowerCase().replace(/[^a-z']/g, "");
-    const spokenClean = spoken.toLowerCase().replace(/[^a-z']/g, "");
-    if (spokenClean === correct) {
+    const clean = answer.toLowerCase().replace(/[^a-z']/g, "");
+    if (clean === correct) {
       setFeedback({ type: "correct", msg: "✓ Correct!" });
       const updated = { ...blanksStatus, [currentBlankIdx]: "correct" };
       setBlanksStatus(updated);
       setTimeout(() => advanceBlank(), 900);
     } else {
-      setFeedback({ type: "wrong", msg: `"${spoken}" — try again` });
+      setFeedback({ type: "wrong", msg: `"${answer}" — try again` });
+      focusInput();
     }
-  }, [currentBlankIdx, tokens, blanksStatus, advanceBlank]);
+  }, [currentBlankIdx, tokens, blanksStatus, advanceBlank, focusInput]);
+
+  const submitAnswer = () => {
+    if (typedAnswer.trim()) {
+      const a = typedAnswer.trim();
+      setTypedAnswer("");
+      checkAnswer(a);
+    }
+  };
 
   // ── hints (multi-tap) ─────────────────────────────────────────────────────
 
@@ -195,6 +204,7 @@ export default function RecallTrainer() {
       const revealed = nextStage - 1;
       setHint(letters.map((l, i) => (i < revealed ? l : "_")).join(" "));
     }
+    focusInput();
   };
 
   // ── reveal ────────────────────────────────────────────────────────────────
@@ -248,13 +258,16 @@ export default function RecallTrainer() {
     setFeedback(null);
     setHint("");
     setHintStage(0);
-    setTranscript("");
+    setTypedAnswer("");
     const wordIdxs = [...newRemoved].sort((a, b) => a - b);
     const initialStatus = {};
     wordIdxs.forEach((i) => (initialStatus[i] = "pending"));
     setBlanksStatus(initialStatus);
     setBlanksOrder(wordIdxs);
-    if (wordIdxs.length > 0) setCurrentBlankIdx(wordIdxs[0]);
+    if (wordIdxs.length > 0) {
+      setCurrentBlankIdx(wordIdxs[0]);
+      setTimeout(() => inputRef.current?.focus(), 150);
+    }
   };
 
   const nextLevel = () => {
@@ -271,69 +284,6 @@ export default function RecallTrainer() {
     setRoundHistory([]);
     setScreen("upload");
   };
-
-  // ── audio recording ───────────────────────────────────────────────────────
-
-  const transcribeAudio = useCallback(async (audioBlob) => {
-    const arrayBuffer = await audioBlob.arrayBuffer();
-    const uint8 = new Uint8Array(arrayBuffer);
-    let binary = "";
-    for (let i = 0; i < uint8.length; i++) binary += String.fromCharCode(uint8[i]);
-    const base64Audio = btoa(binary);
-    try {
-      const data = await claudeFetch({
-        model: "claude-sonnet-4-6",
-        messages: [{
-          role: "user",
-          content: [
-            { type: "text", text: "This is a voice recording of someone saying a single English word or short phrase. Transcribe ONLY what was spoken — return just the word(s), lowercase, no punctuation, no explanation." },
-            { type: "document", source: { type: "base64", media_type: audioBlob.type || "audio/webm", data: base64Audio } }
-          ]
-        }]
-      });
-      return data.content?.map(b => b.text || "").join("").trim().toLowerCase() || "";
-    } catch {
-      return "";
-    }
-  }, []);
-
-  const startListening = useCallback(async () => {
-    setListening(true);
-    setTranscript("");
-    setFeedback(null);
-    setHint("");
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mimeType = ["audio/webm", "audio/mp4", "audio/ogg", "audio/wav"].find(m => MediaRecorder.isTypeSupported(m)) || "";
-      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
-      audioChunksRef.current = [];
-      mediaRecorderRef.current = recorder;
-      recorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data); };
-      recorder.onstop = async () => {
-        stream.getTracks().forEach(t => t.stop());
-        const blob = new Blob(audioChunksRef.current, { type: mimeType || "audio/webm" });
-        setListening(false);
-        setTranscript("Transcribing…");
-        const spoken = await transcribeAudio(blob);
-        if (spoken) {
-          setTranscript(spoken);
-          checkAnswer(spoken);
-        } else {
-          setTranscript("");
-          setFeedback({ type: "wrong", msg: "Couldn't hear that — tap again to try" });
-        }
-      };
-      recorder.start();
-      setTimeout(() => { if (recorder.state === "recording") recorder.stop(); }, 4000);
-    } catch {
-      setListening(false);
-      setMicBlocked(true);
-    }
-  }, [transcribeAudio, checkAnswer]);
-
-  const stopListening = useCallback(() => {
-    if (mediaRecorderRef.current?.state === "recording") mediaRecorderRef.current.stop();
-  }, []);
 
   // ── render passage ────────────────────────────────────────────────────────
 
@@ -429,27 +379,6 @@ export default function RecallTrainer() {
     <div style={S.root}>
       <style>{css}</style>
 
-      {micBlocked && (
-        <div style={S.modalOverlay}>
-          <div style={S.modalCard}>
-            <div style={{ fontSize: 36, marginBottom: 8 }}>🎙</div>
-            <h2 style={S.modalTitle}>Microphone blocked</h2>
-            <p style={S.modalBody}>Safari caches permissions — update Settings <em>then reload this page</em>.</p>
-            <ol style={S.modalSteps}>
-              <li>Open <strong style={{ color: "#F2E8D5" }}>Settings</strong> on your iPhone</li>
-              <li>Tap <strong style={{ color: "#F2E8D5" }}>Apps → Safari → Microphone</strong></li>
-              <li>Select <strong style={{ color: "#F5A623" }}>Allow</strong></li>
-              <li><strong style={{ color: "#F5A623" }}>Reload this page</strong></li>
-            </ol>
-            <p style={{ ...S.modalBody, marginBottom: 16 }}>Or type your answers instead:</p>
-            <div style={{ display: "flex", flexDirection: "column", gap: 10, width: "100%" }}>
-              <button style={{ ...S.btn, ...S.btnPrimary }} onClick={() => { setMicBlocked(false); setUseTyping(true); }}>⌨️ Switch to typing</button>
-              <button style={{ ...S.btn, ...S.btnGhost }} onClick={() => setMicBlocked(false)}>Try mic again</button>
-            </div>
-          </div>
-        </div>
-      )}
-
       <div style={S.gameHeader}>
         <div style={S.logo}>◎ Recall</div>
         <div style={S.levelBadge}>Level {level}</div>
@@ -463,6 +392,8 @@ export default function RecallTrainer() {
 
       {currentBlankIdx !== null && (
         <div style={S.controls}>
+
+          {/* Feedback */}
           {feedback && (
             <div style={{
               ...S.feedbackBox,
@@ -472,6 +403,7 @@ export default function RecallTrainer() {
             }}>{feedback.msg}</div>
           )}
 
+          {/* Hint display */}
           {hint && (
             <div style={S.hintBox}>
               <span style={{ opacity: 0.6, fontSize: 11, fontFamily: "system-ui, sans-serif", letterSpacing: "0.1em", textTransform: "uppercase", display: "block", marginBottom: 4 }}>
@@ -483,45 +415,38 @@ export default function RecallTrainer() {
             </div>
           )}
 
-          {transcript && transcript !== "Transcribing…" && !feedback && (
-            <div style={S.transcriptBox}>Heard: "{transcript}"</div>
-          )}
-          {transcript === "Transcribing…" && (
-            <div style={{ ...S.transcriptBox, color: "#F5A623" }}>✦ Transcribing…</div>
-          )}
-
-          <button style={{ ...S.btn, ...S.btnSpeak, ...(listening ? S.btnListening : {}) }}
-            onClick={listening ? stopListening : startListening}
-            disabled={transcript === "Transcribing…" || useTyping}>
-            {transcript === "Transcribing…" ? "✦ Transcribing…" : listening ? "⏹ Tap to stop" : "🎙 Speak the word"}
-          </button>
-
-          {useTyping && (
-            <div style={{ display: "flex", gap: 8 }}>
-              <input style={S.typeInput} type="text" placeholder="Type the missing word…"
-                value={typedAnswer} onChange={e => setTypedAnswer(e.target.value)}
-                onKeyDown={e => { if (e.key === "Enter" && typedAnswer.trim()) { const a = typedAnswer.trim(); setTypedAnswer(""); checkAnswer(a); } }}
-                autoFocus autoCapitalize="none" autoCorrect="off" spellCheck={false} />
-              <button style={{ ...S.btn, ...S.btnPrimary, width: "auto", padding: "0 20px" }}
-                onClick={() => { if (typedAnswer.trim()) { const a = typedAnswer.trim(); setTypedAnswer(""); checkAnswer(a); } }}>↵</button>
-            </div>
-          )}
-
-          <div style={S.secondaryBtns}>
-            <button style={{ ...S.btn, ...S.btnGhost }} onClick={revealWord} disabled={listening}>👁 Reveal</button>
-            <button style={{ ...S.btn, ...S.btnGhost }} onClick={() => { setUseTyping(t => !t); setTypedAnswer(""); }}>{useTyping ? "🎙" : "⌨️"}</button>
+          {/* Input row + Hints button side by side */}
+          <div style={S.inputRow}>
+            <input
+              ref={inputRef}
+              style={S.typeInput}
+              type="text"
+              placeholder="Type the missing word…"
+              value={typedAnswer}
+              onChange={e => setTypedAnswer(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter") submitAnswer(); }}
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+              autoFocus
+            />
+            <button style={S.hintsBtn} onClick={tapHint} disabled={loading}>
+              {loading ? "…" : hintStage === 0 ? "Hints" : hintStage === 1 ? "Letter?" : "+1"}
+            </button>
+            <button style={{ ...S.btn, ...S.btnPrimary, width: "auto", padding: "0 18px", fontSize: 20 }}
+              onClick={submitAnswer}>↵</button>
           </div>
-        </div>
-      )}
 
-      {currentBlankIdx !== null && (
-        <button style={S.floatingHint} onClick={tapHint} disabled={loading}>
-          {loading ? "…" : hintStage === 0 ? "Hints" : hintStage === 1 ? "Letter?" : "+1 letter"}
-        </button>
+          {/* Reveal */}
+          <button style={{ ...S.btn, ...S.btnGhost }} onClick={revealWord}>👁 Reveal</button>
+
+        </div>
       )}
     </div>
   );
 }
+
+// ── styles ────────────────────────────────────────────────────────────────────
 
 const S = {
   root: { minHeight: "100vh", background: "#0F1117", color: "#F2E8D5", fontFamily: "'Georgia', serif", display: "flex", flexDirection: "column", alignItems: "center", padding: "24px 16px 48px" },
@@ -532,8 +457,6 @@ const S = {
   charCount: { color: "#555", fontSize: 12, alignSelf: "flex-end", fontFamily: "system-ui, sans-serif", marginBottom: 20 },
   btn: { border: "none", borderRadius: 8, padding: "14px 24px", fontSize: 15, cursor: "pointer", fontFamily: "system-ui, sans-serif", fontWeight: 500, transition: "opacity 0.15s", width: "100%" },
   btnPrimary: { background: "#F5A623", color: "#0F1117" },
-  btnSpeak: { background: "#1E2436", color: "#F2E8D5", border: "1px solid #F5A623", fontSize: 16 },
-  btnListening: { background: "rgba(245,166,35,0.15)", borderColor: "#F5A623", color: "#F5A623" },
   btnGhost: { background: "transparent", color: "#888", border: "1px solid #2A2F40", padding: "10px 12px", fontSize: 13 },
   gameHeader: { width: "100%", maxWidth: 680, display: "flex", alignItems: "center", gap: 12, marginBottom: 24 },
   levelBadge: { fontFamily: "system-ui, sans-serif", fontSize: 11, letterSpacing: "0.12em", color: "#F5A623", background: "rgba(245,166,35,0.12)", borderRadius: 20, padding: "3px 10px" },
@@ -544,9 +467,9 @@ const S = {
   controls: { width: "100%", maxWidth: 680, display: "flex", flexDirection: "column", gap: 12 },
   feedbackBox: { padding: "12px 16px", borderRadius: 8, border: "1px solid", fontFamily: "system-ui, sans-serif", fontSize: 14, textAlign: "center" },
   hintBox: { padding: "12px 16px", borderRadius: 8, background: "rgba(245,166,35,0.08)", border: "1px solid rgba(245,166,35,0.2)", color: "#F5A623", fontFamily: "system-ui, sans-serif", fontSize: 14 },
-  floatingHint: { position: "fixed", bottom: 28, right: 24, background: "#1E2436", border: "1px solid #3A3F52", borderRadius: 24, color: "#F2E8D5", fontFamily: "system-ui, sans-serif", fontWeight: 600, fontSize: 14, padding: "12px 20px", cursor: "pointer", zIndex: 50, boxShadow: "0 4px 20px rgba(0,0,0,0.4)", letterSpacing: "0.03em" },
-  transcriptBox: { padding: "10px 16px", borderRadius: 8, background: "#1E2436", color: "#888", fontFamily: "system-ui, sans-serif", fontSize: 13, textAlign: "center" },
-  secondaryBtns: { display: "flex", gap: 8 },
+  inputRow: { display: "flex", gap: 8, alignItems: "stretch" },
+  typeInput: { flex: 1, background: "#181C27", border: "1px solid #F5A623", borderRadius: 8, color: "#F2E8D5", fontFamily: "'Georgia', serif", fontSize: 16, padding: "12px 14px", outline: "none" },
+  hintsBtn: { background: "#1E2436", border: "1px solid #3A3F52", borderRadius: 8, color: "#F2E8D5", fontFamily: "system-ui, sans-serif", fontWeight: 600, fontSize: 13, padding: "0 14px", cursor: "pointer", whiteSpace: "nowrap" },
   scoreCard: { width: "100%", maxWidth: 480, display: "flex", flexDirection: "column", alignItems: "center", paddingTop: 48, gap: 16 },
   bigScore: { fontSize: 72, fontWeight: 700, color: "#F5A623", lineHeight: 1 },
   scoreLabel: { color: "#888", fontFamily: "system-ui, sans-serif", fontSize: 14, margin: 0 },
@@ -555,12 +478,6 @@ const S = {
   historyRow: { display: "flex", alignItems: "center", gap: 12, color: "#F2E8D5" },
   histBar: { flex: 1, height: 4, background: "#1E2436", borderRadius: 2, overflow: "hidden" },
   histFill: { height: "100%", background: "#F5A623", borderRadius: 2 },
-  modalOverlay: { position: "fixed", inset: 0, background: "rgba(10,12,18,0.92)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, padding: 24 },
-  modalCard: { background: "#181C27", border: "1px solid #2A2F40", borderRadius: 16, padding: "32px 24px", maxWidth: 380, width: "100%", display: "flex", flexDirection: "column", alignItems: "center", textAlign: "center" },
-  modalTitle: { fontFamily: "system-ui, sans-serif", fontSize: 20, fontWeight: 600, color: "#F2E8D5", margin: "0 0 12px" },
-  modalBody: { fontFamily: "system-ui, sans-serif", fontSize: 14, color: "#888", margin: "0 0 20px", lineHeight: 1.6 },
-  modalSteps: { fontFamily: "system-ui, sans-serif", fontSize: 14, color: "#888", textAlign: "left", lineHeight: 2, paddingLeft: 20, margin: "0 0 16px", width: "100%" },
-  typeInput: { flex: 1, background: "#181C27", border: "1px solid #F5A623", borderRadius: 8, color: "#F2E8D5", fontFamily: "'Georgia', serif", fontSize: 16, padding: "12px 14px", outline: "none" },
 };
 
 const css = `
